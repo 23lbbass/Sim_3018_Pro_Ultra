@@ -32,6 +32,8 @@ class GrblEmulator:
         # Homing parameters
         self.home_pos = [300.0, 180.0, 45.0]  # Max travel position (Home)
         self.homing = False
+        self.is_relative = False
+        self.wco = [0.0, 0.0, 0.0]
         
         # Grbl settings map
         self.settings = {
@@ -88,7 +90,7 @@ class GrblEmulator:
 
     def _send_status(self):
         # Format: <Idle|MPos:0.000,0.000,0.000|Bf:15,128|FS:0,0>
-        status_str = f"<{self.state}|MPos:{self.mpos[0]:.3f},{self.mpos[1]:.3f},{self.mpos[2]:.3f}|FS:{int(self.feed_rate)},0>\r\n"
+        status_str = f"<{self.state}|MPos:{self.mpos[0]:.3f},{self.mpos[1]:.3f},{self.mpos[2]:.3f}|WCO:{self.wco[0]:.3f},{self.wco[1]:.3f},{self.wco[2]:.3f}|FS:{int(self.feed_rate)},0>\r\n"
         self._send(status_str)
 
     def _handle_command(self, cmd):
@@ -102,6 +104,9 @@ class GrblEmulator:
             if cmd == "$H" or cmd == "$HA":
                 self._start_homing()
                 self._send("ok\r\n")
+            elif cmd.startswith("$J="):
+                self._parse_gcode(cmd[3:], is_jog=True)
+                self._send("ok\r\n")
             elif cmd == "$I":
                 self._send("[VER:1.1f.20170801:]\r\n[OPT:V,15,128]\r\nok\r\n")
             elif cmd == "$X":
@@ -111,29 +116,53 @@ class GrblEmulator:
                 self._send("[GC:G0 G54 G17 G21 G90 G94 M5 M9 T0 F0 S0]\r\nok\r\n")
             else:
                 self._send("ok\r\n") # Fake setting success
-        elif cmd.startswith("G"):
+        else:
             self._parse_gcode(cmd)
             self._send("ok\r\n")
-        else:
-            self._send("ok\r\n")
 
-    def _parse_gcode(self, gcode):
-        # Very basic GCode parser for linear moves (G0, G1)
-        tokens = gcode.split()
+    def _parse_gcode(self, gcode, is_jog=False):
+        # Strip out comments
+        gcode = re.sub(r'\(.*?\)', '', gcode)
+        
+        # Improved parser for linear moves and jog commands
+        tokens = re.findall(r'([A-Z])([-+]?\d*\.?\d+)', gcode.upper())
+        
+        # Check if it's an offset/zeroing command (G92 or G10)
+        for k, v in tokens:
+            if k == 'G' and float(v) in (10, 92):
+                for axis, val_str in tokens:
+                    if axis == 'X': self.wco[0] = self.mpos[0] - float(val_str)
+                    elif axis == 'Y': self.wco[1] = self.mpos[1] - float(val_str)
+                    elif axis == 'Z': self.wco[2] = self.mpos[2] - float(val_str)
+                return
+
         is_move = False
         target = list(self.target_mpos)
         
-        for token in tokens:
-            if token.startswith('F'):
-                self.feed_rate = float(token[1:])
-            elif token.startswith('X'):
-                target[0] = float(token[1:])
+        # Check for absolute/relative mode in this block
+        is_rel_block = self.is_relative
+        for k, v in tokens:
+            if k == 'G':
+                val = float(v)
+                if val == 90:
+                    is_rel_block = False
+                    if not is_jog: self.is_relative = False
+                elif val == 91:
+                    is_rel_block = True
+                    if not is_jog: self.is_relative = True
+        
+        for k, v in tokens:
+            val = float(v)
+            if k == 'F':
+                self.feed_rate = max(val, 0.1)
+            elif k == 'X':
+                target[0] = self.target_mpos[0] + val if is_rel_block else val + self.wco[0]
                 is_move = True
-            elif token.startswith('Y'):
-                target[1] = float(token[1:])
+            elif k == 'Y':
+                target[1] = self.target_mpos[1] + val if is_rel_block else val + self.wco[1]
                 is_move = True
-            elif token.startswith('Z'):
-                target[2] = float(token[1:])
+            elif k == 'Z':
+                target[2] = self.target_mpos[2] + val if is_rel_block else val + self.wco[2]
                 is_move = True
                 
         if is_move:
