@@ -68,6 +68,12 @@ class GrblEmulator:
                 
                 if char == '?':
                     self._send_status()
+                elif char == '~': # Cycle Start / Resume
+                    if self.state == "Hold":
+                        if hasattr(self, 'motion_queue') and len(self.motion_queue) > 0:
+                            self.state = "Run"
+                        else:
+                            self.state = "Idle"
                 elif char == '\x18': # Ctrl-X Soft Reset
                     self.state = "Alarm"
                     self._send("Grbl 1.1f ['$' for help]\r\n")
@@ -96,6 +102,12 @@ class GrblEmulator:
     def _handle_command(self, cmd):
         # print("RECV:", cmd)
         cmd = cmd.upper()
+        
+        if self.state == "Alarm":
+            if cmd not in ("$X", "$H", "$HA", "$$", "?", "\x18") and not cmd.startswith("$I") and not cmd.startswith("$G"):
+                self._send("error:9\r\n")
+                return
+
         if cmd == "$$":
             for k, v in self.settings.items():
                 self._send(f"{k}={v}\r\n")
@@ -136,8 +148,19 @@ class GrblEmulator:
                     elif axis == 'Z': self.wco[2] = self.mpos[2] - float(val_str)
                 return
 
-        is_move = False
+        # Determine modal command for this block (G0, G1, G2, G3)
+        # Default to whatever the last motion command was (we'll implement basic state)
+        if not hasattr(self, 'motion_mode'):
+            self.motion_mode = 0  # 0=G0, 1=G1, 2=G2, 3=G3
+
+        for k, v in tokens:
+            if k == 'G':
+                val = int(float(v))
+                if val in (0, 1, 2, 3):
+                    self.motion_mode = val
+        
         target = list(self.target_mpos)
+        arc_offsets = {'I': 0.0, 'J': 0.0, 'K': 0.0}
         
         # Check for absolute/relative mode in this block
         is_rel_block = self.is_relative
@@ -151,6 +174,7 @@ class GrblEmulator:
                     is_rel_block = True
                     if not is_jog: self.is_relative = True
         
+        is_move = False
         for k, v in tokens:
             val = float(v)
             if k == 'F':
@@ -164,14 +188,96 @@ class GrblEmulator:
             elif k == 'Z':
                 target[2] = self.target_mpos[2] + val if is_rel_block else val + self.wco[2]
                 is_move = True
+            elif k in ('I', 'J', 'K'):
+                arc_offsets[k] = val
+            elif k == 'M':
+                # M0 = Hold, M3/M4 = Spindle On, M5 = Spindle Off, M30 = End
+                m_val = int(val)
+                if m_val == 0:
+                    self.state = "Hold"
+                    # We would technically wait for a '~' resume command 
+                elif m_val in (3, 4):
+                    # Spindle on
+                    pass 
+                elif m_val == 5:
+                    # Spindle off
+                    pass
+                elif m_val == 30:
+                    # End of program, technically rewinds
+                    pass
                 
         if is_move:
-            self.target_mpos = target
+            if not hasattr(self, 'motion_queue'):
+                self.motion_queue = []
+                
+            if self.motion_mode in (2, 3):
+                # Generate arc segments
+                self._generate_arc(target, arc_offsets, self.motion_mode == 2)
+            else:
+                self.motion_queue.append(target)
+                
+            self.target_mpos = self.motion_queue[0]
             self.state = "Run"
+
+    def _generate_arc(self, target, offsets, is_cw):
+        # Extremely simplified arc handling, assumes G17 (XY plane)
+        start_x = self.target_mpos[0]
+        start_y = self.target_mpos[1]
+        
+        center_x = start_x + offsets['I']
+        center_y = start_y + offsets['J']
+        
+        end_x = target[0]
+        end_y = target[1]
+        
+        radius = math.hypot(start_x - center_x, start_y - center_y)
+        
+        if radius < 0.001:
+            self.motion_queue.append(target)
+            return
+            
+        start_angle = math.atan2(start_y - center_y, start_x - center_x)
+        end_angle = math.atan2(end_y - center_y, end_x - center_x)
+        
+        # Ensure correct direction traversal
+        if is_cw:
+            while end_angle > start_angle:
+                end_angle -= 2 * math.pi
+        else:
+            while end_angle < start_angle:
+                end_angle += 2 * math.pi
+                
+        # If full circle
+        if abs(end_angle - start_angle) < 0.0001:
+            if is_cw:
+                end_angle = start_angle - 2 * math.pi
+            else:
+                end_angle = start_angle + 2 * math.pi
+
+        angular_travel = abs(end_angle - start_angle)
+        
+        # Segment length approx 1mm
+        num_segments = max(2, int(radius * angular_travel / 1.0))
+        
+        z_start = self.target_mpos[2]
+        z_end = target[2]
+        
+        for i in range(1, num_segments + 1):
+            t = i / num_segments
+            angle = start_angle + (end_angle - start_angle) * t
+            
+            x = center_x + radius * math.cos(angle)
+            y = center_y + radius * math.sin(angle)
+            z = z_start + (z_end - z_start) * t
+            
+            self.motion_queue.append([x, y, z])
+            
+        self.target_mpos = target # update logical target for next block
 
     def _start_homing(self):
         self.state = "Home"
         self.homing = True
+        self.home_pos = [self.settings["$130"], self.settings["$131"], self.settings["$132"]]
         
         def run_homing():
             # Z up to limit
@@ -213,6 +319,9 @@ class GrblEmulator:
             # Finish homing
             self.mpos = list(self.home_pos)
             self.wpos = [0.0, 0.0, 0.0]
+            self.target_mpos = list(self.home_pos)
+            if hasattr(self, 'motion_queue'):
+                self.motion_queue.clear()
             self.homing = False
             self.state = "Idle"
             
@@ -220,15 +329,23 @@ class GrblEmulator:
 
     def _motion_loop(self):
         last_time = time.time()
+        if not hasattr(self, 'motion_queue'):
+            self.motion_queue = []
+            
         while self.running:
             now = time.time()
             dt = now - last_time
             last_time = now
             
             if self.state in ("Run", "Home"):
-                dx = self.target_mpos[0] - self.mpos[0]
-                dy = self.target_mpos[1] - self.mpos[1]
-                dz = self.target_mpos[2] - self.mpos[2]
+                if self.state == "Run" and hasattr(self, 'motion_queue') and len(self.motion_queue) > 0:
+                    current_target = self.motion_queue[0]
+                else:
+                    current_target = self.target_mpos
+                    
+                dx = current_target[0] - self.mpos[0]
+                dy = current_target[1] - self.mpos[1]
+                dz = current_target[2] - self.mpos[2]
                 
                 dist = math.sqrt(dx*dx + dy*dy + dz*dz)
                 if dist > 0.001:
@@ -237,15 +354,38 @@ class GrblEmulator:
                     step = (speed / 60.0) * dt
                     
                     if step >= dist:
-                        self.mpos = list(self.target_mpos)
-                        if not self.homing:
-                            self.state = "Idle"
+                        next_pos = list(current_target)
                     else:
-                        self.mpos[0] += (dx / dist) * step
-                        self.mpos[1] += (dy / dist) * step
-                        self.mpos[2] += (dz / dist) * step
+                        next_pos = [
+                            self.mpos[0] + (dx / dist) * step,
+                            self.mpos[1] + (dy / dist) * step,
+                            self.mpos[2] + (dz / dist) * step
+                        ]
+                        
+                    hit_limit = False
+                    max_pos = [self.settings["$130"], self.settings["$131"], self.settings["$132"]]
+                    for i in range(3):
+                        if next_pos[i] < 0.0 or next_pos[i] > max_pos[i]:
+                            hit_limit = True
+                            next_pos[i] = max(0.0, min(next_pos[i], max_pos[i]))
+                    
+                    self.mpos = next_pos
+                    
+                    if hit_limit and not self.homing:
+                        self.target_mpos = list(self.mpos)
+                        if hasattr(self, 'motion_queue'):
+                            self.motion_queue.clear()
+                        self.state = "Alarm"
+                        self._send("ALARM:1\r\n[MSG:Hard limit triggered. Machine position is likely lost due to sudden and immediate halt. Re-homing is highly recommended.]\r\n")
+                    elif step >= dist:
+                        if self.state == "Run" and hasattr(self, 'motion_queue') and len(self.motion_queue) > 0:
+                            self.motion_queue.pop(0)
+                        if not self.homing and not (hasattr(self, 'motion_queue') and len(self.motion_queue) > 0):
+                            self.state = "Idle"
                 else:
-                    if not self.homing:
+                    if self.state == "Run" and hasattr(self, 'motion_queue') and len(self.motion_queue) > 0:
+                        self.motion_queue.pop(0)
+                    if not self.homing and not (hasattr(self, 'motion_queue') and len(self.motion_queue) > 0):
                         self.state = "Idle"
             
             time.sleep(0.01)

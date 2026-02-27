@@ -95,7 +95,7 @@ class CNCGui(QMainWindow):
     def build_machine(self):
         b_w, b_l = 340, 280
         x_start, y_start = -20, 0
-        tool_y = 60 # Y position of the spindle in world coordinates
+        tool_y = 170 # Y position of the spindle in world coordinates
         
         # 1. Base (Fixed)
         self.create_box((20, b_l, 40), self.color_orange, offset=(x_start, y_start, -40))
@@ -125,9 +125,10 @@ class CNCGui(QMainWindow):
 
         # 3. Y-Table (Moves along Y)
         t_w, t_l = 300, 180
-        self.create_box((t_w, t_l, 15), self.color_table, group=self.y_table_items, offset=(0, tool_y, -15))
+        table_start_y = 170
+        self.create_box((t_w, t_l, 15), self.color_table, group=self.y_table_items, offset=(0, table_start_y, -15))
         for i in range(1, 6):
-            self.create_box((t_w, 2, 2), self.color_dark, group=self.y_table_items, offset=(0, tool_y + i*30, -2))
+            self.create_box((t_w, 2, 2), self.color_dark, group=self.y_table_items, offset=(0, table_start_y + i*30, -2))
 
         # 4. X-Carriage (Moves along X)
         c_w, c_h = 70, 90
