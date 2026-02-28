@@ -39,10 +39,19 @@ class CNCGui(QMainWindow):
         self.status_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         self.layout.addWidget(self.status_label)
         
+        from PyQt5.QtWidgets import QPlainTextEdit
+        self.log_textbox = QPlainTextEdit()
+        self.log_textbox.setReadOnly(True)
+        self.log_textbox.setMaximumHeight(200)
+        self.log_textbox.setStyleSheet("font-family: monospace; font-size: 12px; background-color: #f8f8f8; padding: 5px;")
+        
         self.view = gl.GLViewWidget()
         self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.view.setBackgroundColor('#E5E7EB')
+        
+        # Add a splitter or just add to layout. Since we want it below, add view then textbox.
         self.layout.addWidget(self.view)
+        self.layout.addWidget(self.log_textbox)
         
         # Look from the front-left!
         self.view.setCameraPosition(distance=600, elevation=35, azimuth=-140)
@@ -156,6 +165,12 @@ class CNCGui(QMainWindow):
             self.status_label.setText(
                 f"State: {state} | Port: {port} | MPos: X:{mpos[0]:.2f} Y:{mpos[1]:.2f} Z:{mpos[2]:.2f} | Machine: 3018 Pro Ultra"
             )
+            
+            if hasattr(self.emulator, 'log_queue') and hasattr(self.emulator, 'log_lock'):
+                with self.emulator.log_lock:
+                    while self.emulator.log_queue:
+                        msg = self.emulator.log_queue.popleft()
+                        self.log_textbox.appendPlainText(msg)
             
             # The table offsets are already configured such that MPos Y=0 
             # places the front edge of the table under the tool.

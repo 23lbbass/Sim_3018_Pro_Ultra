@@ -6,11 +6,22 @@ import threading
 import time
 import re
 import math
+import datetime
+from collections import deque
 
 class GrblEmulator:
+    # Initialize the Emulator
     def __init__(self):
         self.master, self.slave = pty.openpty()
         self.port_name = os.ttyname(self.slave)
+        
+        # Logging setup
+        self.log_queue = deque(maxlen=1000)
+        self.log_lock = threading.Lock()
+        
+        log_filename = datetime.datetime.now().strftime("simulator_traffic_%Y%m%d_%H%M%S.log")
+        self.log_file = open(os.path.join(os.path.dirname(__file__), log_filename), "a")
+        self.log_traffic("SYS", f"Emulator started on port {self.port_name}")
         
         # Configure the slave port to raw mode to emulate serial
         tty.setraw(self.slave)
@@ -23,6 +34,7 @@ class GrblEmulator:
         print(f"GRBL Emulator listening on: {self.port_name}")
 
         self.running = True
+        self.cmd_queue = []
         self.state = "Idle"
         self.mpos = [0.0, 0.0, 0.0]  # X, Y, Z
         self.wpos = [0.0, 0.0, 0.0]
@@ -55,6 +67,19 @@ class GrblEmulator:
         self.move_thread.daemon = True
         self.move_thread.start()
 
+    def log_traffic(self, direction, msg):
+        timestamp = datetime.datetime.now().strftime("[%H:%M:%S.%f]")[:-3] + "]"
+        clean_msg = msg.replace('\r', '').replace('\n', ' ').strip()
+        if not clean_msg:
+            return
+            
+        log_str = f"{timestamp} {direction}: {clean_msg}"
+        with self.log_lock:
+            self.log_queue.append(log_str)
+            if self.log_file and not self.log_file.closed:
+                self.log_file.write(log_str + "\n")
+                self.log_file.flush()
+
     def _serial_loop(self):
         buffer = ""
         while self.running:
@@ -67,19 +92,27 @@ class GrblEmulator:
                 char = data.decode("utf-8", errors="ignore")
                 
                 if char == '?':
+                    self.log_traffic("RX", "?")
                     self._send_status()
                 elif char == '~': # Cycle Start / Resume
-                    if self.state == "Hold":
+                    self.log_traffic("RX", "~")
+                    if self.state.startswith("Hold"):
                         if hasattr(self, 'motion_queue') and len(self.motion_queue) > 0:
                             self.state = "Run"
                         else:
                             self.state = "Idle"
                 elif char == '\x18': # Ctrl-X Soft Reset
+                    self.log_traffic("RX", "<Ctrl-X Soft Reset>")
                     self.state = "Alarm"
+                    self.cmd_queue.clear()
+                    if hasattr(self, 'motion_queue'):
+                        self.motion_queue.clear()
+                    self.target_mpos = list(self.mpos)
                     self._send("Grbl 1.1f ['$' for help]\r\n")
                 elif char in ('\r', '\n'):
                     if buffer.strip():
-                        self._handle_command(buffer.strip())
+                        self.log_traffic("RX", buffer.strip())
+                        self.cmd_queue.append(buffer.strip())
                     buffer = ""
                 else:
                     buffer += char
@@ -90,6 +123,7 @@ class GrblEmulator:
 
     def _send(self, msg):
         try:
+            self.log_traffic("TX", msg)
             os.write(self.master, msg.encode("utf-8"))
         except:
             pass
@@ -144,8 +178,8 @@ class GrblEmulator:
             if k == 'G' and float(v) in (10, 92):
                 for axis, val_str in tokens:
                     if axis == 'X': self.wco[0] = self.mpos[0] - float(val_str)
-                    elif axis == 'Y': self.wco[1] = self.mpos[1] - float(val_str)
-                    elif axis == 'Z': self.wco[2] = self.mpos[2] - float(val_str)
+                    if axis == 'Y': self.wco[1] = self.mpos[1] - float(val_str)
+                    if axis == 'Z': self.wco[2] = self.mpos[2] - float(val_str)
                 return
 
         # Determine modal command for this block (G0, G1, G2, G3)
@@ -194,8 +228,11 @@ class GrblEmulator:
                 # M0 = Hold, M3/M4 = Spindle On, M5 = Spindle Off, M30 = End
                 m_val = int(val)
                 if m_val == 0:
-                    self.state = "Hold"
-                    # We would technically wait for a '~' resume command 
+                    if not hasattr(self, 'motion_queue'):
+                        self.motion_queue = []
+                    self.motion_queue.append("M0")
+                    if self.state == "Idle":
+                        self.state = "Run"
                 elif m_val in (3, 4):
                     # Spindle on
                     pass 
@@ -215,9 +252,10 @@ class GrblEmulator:
                 self._generate_arc(target, arc_offsets, self.motion_mode == 2)
             else:
                 self.motion_queue.append(target)
+                self.target_mpos = list(target)
                 
-            self.target_mpos = self.motion_queue[0]
-            self.state = "Run"
+            if self.state == "Idle":
+                self.state = "Run"
 
     def _generate_arc(self, target, offsets, is_cw):
         # Extremely simplified arc handling, assumes G17 (XY plane)
@@ -337,9 +375,20 @@ class GrblEmulator:
             dt = now - last_time
             last_time = now
             
+            # Process queued commands from serial only if we have room in the planner buffer (max 15 blocks)
+            # This implements the 'wait' for 'ok' which keeps Candle synchronized perfectly.
+            while len(self.cmd_queue) > 0 and len(self.motion_queue) < 15:
+                cmd = self.cmd_queue.pop(0)
+                self._handle_command(cmd)
+            
             if self.state in ("Run", "Home"):
                 if self.state == "Run" and hasattr(self, 'motion_queue') and len(self.motion_queue) > 0:
                     current_target = self.motion_queue[0]
+                    if current_target == "M0":
+                        self.state = "Hold:0"
+                        self.motion_queue.pop(0)
+                        self.log_traffic("SYS", "Program paused by M0 wait")
+                        continue
                 else:
                     current_target = self.target_mpos
                     
@@ -375,6 +424,7 @@ class GrblEmulator:
                         self.target_mpos = list(self.mpos)
                         if hasattr(self, 'motion_queue'):
                             self.motion_queue.clear()
+                        self.cmd_queue.clear()
                         self.state = "Alarm"
                         self._send("ALARM:1\r\n[MSG:Hard limit triggered. Machine position is likely lost due to sudden and immediate halt. Re-homing is highly recommended.]\r\n")
                     elif step >= dist:
@@ -392,5 +442,8 @@ class GrblEmulator:
 
     def close(self):
         self.running = False
+        self.log_traffic("SYS", "Emulator shutting down")
+        if self.log_file and not self.log_file.closed:
+            self.log_file.close()
         os.close(self.master)
         os.close(self.slave)
